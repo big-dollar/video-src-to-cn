@@ -1,0 +1,5 @@
+opencv-python
+easyocr
+srt
+google-generativeai
+python-dotenv
