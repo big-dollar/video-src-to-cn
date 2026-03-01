@@ -35,6 +35,7 @@ GEMINI_API_KEY=your_api_key_here
 GEMINI_API_URL=https://generativelanguage.googleapis.com/
 GEMINI_MODEL=gemini-2.0-flash
 FRAMES_PER_SECOND=1
+SUBTITLE_GAP_THRESHOLD=0.5
 ```
 
 ## 使用方法

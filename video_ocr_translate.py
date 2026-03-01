@@ -20,6 +20,8 @@ GEMINI_API_URL = os.getenv("GEMINI_API_URL", "https://generativelanguage.googlea
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 # 识别频率：每秒识别多少帧 (默认1次)
 FRAMES_PER_SECOND = int(os.getenv("FRAMES_PER_SECOND", "1"))
+# 字幕合并时间间隔阈值（秒）
+SUBTITLE_GAP_THRESHOLD = float(os.getenv("SUBTITLE_GAP_THRESHOLD", "0.5"))
 # ------------------------------------------
 
 def extract_text_from_video(video_path):
@@ -309,7 +311,7 @@ if __name__ == "__main__":
                 continue
             
             # 2. 先合并时间相近的短字幕（在翻译之前合并）
-            segments = merge_short_subtitles(segments, min_duration=2.0, gap_threshold=0.5)
+            segments = merge_short_subtitles(segments, min_duration=2.0, gap_threshold=SUBTITLE_GAP_THRESHOLD)
             
             # 3. 从合并后的字幕提取文本进行翻译
             original_texts = [s['text'].strip() for s in segments]
