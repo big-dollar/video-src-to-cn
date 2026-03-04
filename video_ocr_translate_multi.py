@@ -2,49 +2,73 @@ import os
 import cv2
 import easyocr
 import srt
+import time
 import ssl
+import multiprocessing as mp
 from datetime import timedelta
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
 
 # 忽略 SSL 证书验证错误 (通常由于公司网络、代理软件或代理证书导致)
 ssl._create_default_https_context = ssl._create_unverified_context
 
-from dotenv import load_dotenv
 load_dotenv()
 
 # ----------------- 配置区 -----------------
-# 视频目录（当前目录）
 VIDEO_DIR = "." 
-# Gemini API Key (从 .env 读取)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-# Gemini API 地址 (从 .env 读取)
 GEMINI_API_URL = os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com/")
-# 模型名称 (从 .env 读取)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-# 识别频率：每秒识别多少帧 (默认1次)
 FRAMES_PER_SECOND = int(os.getenv("FRAMES_PER_SECOND", "1"))
-# 字幕合并时间间隔阈值（秒）
 SUBTITLE_GAP_THRESHOLD = float(os.getenv("SUBTITLE_GAP_THRESHOLD", "0.5"))
+
+# 多进程相关配置
+# 可以显式设置进程数，如果不设置则默认使用 (CPU核心数 - 1)
+# 注意：如果内存不够，请调小这个数字
+PROCESS_COUNT = max(1, mp.cpu_count() - 1)
 # ------------------------------------------
 
-def extract_text_from_video(video_path):
-    """使用 OCR 从视频画面中提取英文文本"""
-    # 自动检测是否可以使用GPU
+# 在工作进程中全局保存 reader 实例，避免重复加载
+_worker_reader = None
+
+def init_worker():
+    """每个工作进程启动时的初始化函数"""
+    global _worker_reader
+    # 工作进程初始化时加载模型。为了稳定，多进程下通常强制使用CPU
     try:
-        import torch
-        use_gpu = torch.cuda.is_available()
-        if use_gpu:
-            print("检测到 NVIDIA GPU，正在使用 GPU 加速...")
-        else:
-            print("未检测到 GPU，使用 CPU 运行")
-    except:
-        use_gpu = False
-        print("使用 CPU 运行")
+        # 如果你明确知道要在多进程用 GPU，可以尝试把 False 改为 True，但可能遇到显存溢出或 CUDA 并发报错
+        _worker_reader = easyocr.Reader(['en'], gpu=False)
+    except Exception as e:
+        print(f"进程 {mp.current_process().name} 初始化 OCR 引擎失败: {e}")
+
+def process_frame_task(task_data):
+    """
+    工作进程处理单帧的任务函数
+    task_data = (frame_index, current_time, frame)
+    """
+    global _worker_reader
+    frame_index, current_time, frame = task_data
     
-    print(f"正在初始化 EasyOCR (首次运行会下载模型)...")
-    reader = easyocr.Reader(['en'], gpu=use_gpu)
-    
+    if _worker_reader is None:
+         return frame_index, current_time, ""
+
+    try:
+        # 识别全屏
+        results = _worker_reader.readtext(frame)
+        # 合并概率大于0.4的文本
+        frame_text = " ".join([text for (_, text, prob) in results if prob > 0.4]).strip()
+        return frame_index, current_time, frame_text
+    except Exception as e:
+        print(f"帧 {frame_index} 识别失败: {e}")
+        return frame_index, current_time, ""
+
+def extract_text_from_video_multiprocess(video_path):
+    """使用多进程并发处理视频帧"""
+    from difflib import SequenceMatcher
+    def similar(a, b):
+        return SequenceMatcher(None, a, b).ratio()
+
     print(f"正在分析视频: {video_path}")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -55,23 +79,13 @@ def extract_text_from_video(video_path):
     duration = total_frames / fps
     print(f"视频时长: {duration:.2f} 秒, 帧率: {fps:.2f} fps")
     
-    # 计算需要跳过的帧数
-    frame_skip = int(fps / FRAMES_PER_SECOND)
-    if frame_skip == 0:
-        frame_skip = 1
-        
-    segments = []
-    current_segment = None
+    frame_skip = max(1, int(fps / FRAMES_PER_SECOND))
+    
+    # 提取需要处理的帧
+    print(f"开始提取视频帧... (预计提取 {total_frames // frame_skip} 帧)")
+    tasks = []
     frame_count = 0
     
-    # 相似文本判断阈值
-    similarity_threshold = 0.8 
-    
-    from difflib import SequenceMatcher
-    def similar(a, b):
-        return SequenceMatcher(None, a, b).ratio()
-
-    print("开始逐帧识别字幕 (可能需要较长时间)...")
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -79,67 +93,80 @@ def extract_text_from_video(video_path):
             
         if frame_count % frame_skip == 0:
             current_time = frame_count / fps
+            # 为了减少进程间通信开销和内存占用，可以先转为灰度图或缩放，这里保留原图
+            tasks.append((frame_count, current_time, frame))
             
-            # 为了提高OCR速度和准确度，通常字幕在视频下方
-            # 如果知道字幕的大致位置，可以裁剪画面，例如只取下半部分
-            # height, width, _ = frame.shape
-            # cropped_frame = frame[int(height*0.7):height, 0:width]
-            # results = reader.readtext(cropped_frame)
-            
-            # 全屏识别
-            results = reader.readtext(frame)
-            
-            # 合并识别到的所有文本
-            frame_text = " ".join([text for (_, text, prob) in results if prob > 0.4])
-            frame_text = frame_text.strip()
-            
-            if frame_text:
-                if current_segment is None:
-                    # 发现新字幕
+        frame_count += 1
+    
+    cap.release()
+    print(f"共提取了 {len(tasks)} 帧准备进行 OCR 识别。")
+    print(f"正在启动多进程识别 (使用 {PROCESS_COUNT} 个核心)... 可能需要占用较大内存！")
+
+    start_time_ocr = time.time()
+    results_raw = []
+    
+    # 使用多进程池并发处理
+    with mp.Pool(processes=PROCESS_COUNT, initializer=init_worker) as pool:
+        # imap_unordered 会无序返回结果（哪个先完成先返回），加快遍历速度，但我们需要稍后排序
+        # 为了显示进度，这里使用 imap_unordered
+        completed_count = 0
+        total_tasks = len(tasks)
+        
+        for result in pool.imap_unordered(process_frame_task, tasks):
+            results_raw.append(result)
+            completed_count += 1
+            if completed_count % 10 == 0 or completed_count == total_tasks:
+                percent = (completed_count / total_tasks) * 100
+                print(f"OCR 进度: {completed_count}/{total_tasks} ({percent:.1f}%)")
+
+    # 按帧的索引排序，恢复时间顺序
+    results_raw.sort(key=lambda x: x[0])
+    
+    ocr_cost = time.time() - start_time_ocr
+    print(f"多进程 OCR 识别完成！耗时: {ocr_cost:.2f} 秒。开始合并相似文本...")
+
+    # 将每一帧的独立结果，按连续性和相似度合并为字幕片段
+    segments = []
+    current_segment = None
+    similarity_threshold = 0.8 
+    
+    for frame_index, current_time, frame_text in results_raw:
+        if frame_text:
+            if current_segment is None:
+                current_segment = {
+                    "text": frame_text,
+                    "start": current_time,
+                    "end": current_time + (1.0 / FRAMES_PER_SECOND)
+                }
+            else:
+                if similar(current_segment["text"].lower(), frame_text.lower()) > similarity_threshold:
+                    current_segment["end"] = current_time + (1.0 / FRAMES_PER_SECOND)
+                    if len(frame_text) > len(current_segment["text"]):
+                        current_segment["text"] = frame_text
+                else:
+                    if len(current_segment["text"]) > 2:
+                        segments.append(current_segment)
                     current_segment = {
                         "text": frame_text,
                         "start": current_time,
-                        "end": current_time + (1.0 / FRAMES_PER_SECOND) # 暂定结束时间
+                        "end": current_time + (1.0 / FRAMES_PER_SECOND)
                     }
-                else:
-                    # 判断当前画面文字是否与上一个字幕相同
-                    if similar(current_segment["text"].lower(), frame_text.lower()) > similarity_threshold:
-                        # 文本相同，延长上一个字幕的结束时间
-                        current_segment["end"] = current_time + (1.0 / FRAMES_PER_SECOND)
-                        # 如果新识别的文本更长(可能之前识别不全)，更新文本
-                        if len(frame_text) > len(current_segment["text"]):
-                            current_segment["text"] = frame_text
-                    else:
-                        # 文本不同，保存上一个字幕，开始新的字幕
-                        if len(current_segment["text"]) > 2: # 过滤太短的杂音字符
-                            segments.append(current_segment)
-                        current_segment = {
-                            "text": frame_text,
-                            "start": current_time,
-                            "end": current_time + (1.0 / FRAMES_PER_SECOND)
-                        }
-            else:
-                # 当前帧没有文本，结束上一个字幕
-                if current_segment is not None:
-                    if len(current_segment["text"]) > 2:
-                        segments.append(current_segment)
-                    current_segment = None
-                    
-            if frame_count % (fps * 10) < frame_skip: # 每 10 秒打印一次进度
-                print(f"进度: {current_time:.2f}s / {duration:.2f}s")
+        else:
+            if current_segment is not None:
+                if len(current_segment["text"]) > 2:
+                    segments.append(current_segment)
+                current_segment = None
                 
-        frame_count += 1
-        
-    # 处理最后一个字幕
     if current_segment is not None and len(current_segment["text"]) > 2:
         segments.append(current_segment)
         
-    cap.release()
-    print(f"识别完成，共提取到 {len(segments)} 条字幕。")
+    print(f"提取合并完成，共获得 {len(segments)} 条初步字幕。")
     return segments
 
+# ----------------- 复用原有逻辑 -----------------
+# 翻译、合并短句、生成srt、烧录视频的逻辑保持完全一致，只是直接搬过来
+
 def translate_texts(texts, api_key, api_url, model_name):
-    """使用 Gemini 大模型批量翻译文本"""
     if not texts:
         return []
         
@@ -149,7 +176,6 @@ def translate_texts(texts, api_key, api_url, model_name):
         http_options={"base_url": api_url}
     )
     
-    # 限制每次请求翻译的条数，避免超出模型上下文限制
     batch_size = 50
     all_translated_texts = []
     separator = " |---| "
@@ -187,7 +213,7 @@ def translate_texts(texts, api_key, api_url, model_name):
             if len(translated_batch) == len(batch_texts):
                 all_translated_texts.extend(translated_batch)
             else:
-                print(f"警告：批次 {i} 翻译条数不匹配 (输入 {len(batch_texts)}, 输出 {len(translated_batch)})，尝试逐条翻译...")
+                print(f"警告：批次 {i} 翻译条数不匹配，尝试逐条翻译...")
                 for text in batch_texts:
                     try:
                         resp = client.models.generate_content(
@@ -200,68 +226,48 @@ def translate_texts(texts, api_key, api_url, model_name):
                         all_translated_texts.append(text)
         except Exception as e:
             print(f"批量翻译请求失败: {e}")
-            # 如果批量失败，整个批次保留原文
             all_translated_texts.extend(batch_texts)
              
     return all_translated_texts
 
 def merge_short_subtitles(segments, min_duration=2.0, gap_threshold=0.5):
-    """
-    针对食谱/短语类视频优化：
-    不再将不同文本的内容拼接在一起。
-    仅当相邻两段字幕的时间间隔很短（gap <= gap_threshold）
-    且文本内容几乎一样（或完全包含）时，才合并时间轴并去重。
-    如果是新的单词或短语，立刻作为新字幕独立显示。
-    """
     if not segments:
         return segments
-        
     merged = []
     current = segments[0].copy()
     
     from difflib import SequenceMatcher
     def similar(a, b):
         return SequenceMatcher(None, a, b).ratio()
-    
+        
     for i in range(1, len(segments)):
         next_seg = segments[i]
         gap = next_seg['start'] - current['end']
         
-        # 判断文本是否高度相似，或者一个是另一个的子串（比如 OCR 识别越来越清晰）
         text_a = current['text'].lower()
         text_b = next_seg['text'].lower()
         is_same_content = (similar(text_a, text_b) > 0.8) or (text_a in text_b) or (text_b in text_a)
         
         if gap <= gap_threshold and is_same_content:
-            # 只有当间隔很短，且意思是同一个词/短语时，才合并时间轴，去重
             current['end'] = max(current['end'], next_seg['end'])
-            # 保留较长的那个文本（通常识别更完整）
             if len(next_seg['text']) > len(current['text']):
                 current['text'] = next_seg['text']
         else:
-            # 哪怕间隔很短，只要内容变了（换了新食材），立刻断开，形成新字幕
             merged.append(current)
             current = next_seg.copy()
-    
     merged.append(current)
     return merged
 
 def create_srt(segments, translated_texts, output_path="output.srt"):
-    """生成 SRT 格式的字幕文件"""
     print("正在生成字幕文件...")
     subs = []
-    # 过滤掉无法翻译的空文本
     valid_count = 0
     for i, (segment, trans_text) in enumerate(zip(segments, translated_texts)):
-        # 只保留有实际文本的字幕
         if not trans_text.strip():
             continue
-            
         valid_count += 1
         start_time = timedelta(seconds=segment['start'])
         end_time = timedelta(seconds=segment['end'])
-        
-        # 可选双语输出，这里默认只输出中文
         sub = srt.Subtitle(
             index=valid_count, 
             start=start_time, 
@@ -269,33 +275,28 @@ def create_srt(segments, translated_texts, output_path="output.srt"):
             content=trans_text
         )
         subs.append(sub)
-        
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(srt.compose(subs))
 
 def burn_subtitles_to_video(video_path, srt_path, output_video_path="output_with_subs.mp4"):
-    """将字幕烧录到视频画面中（硬字幕）"""
     print(f"正在将字幕烧录到视频中: {output_video_path} ...")
     import subprocess
-    # 注意：Windows 下需要对路径中的冒号等进行转义，或者使用正斜杠
     srt_path_esc = srt_path.replace('\\', '/').replace(':', '\\:')
-    
     cmd = [
-        'ffmpeg',
-        '-y',               # 覆盖输出
-        '-i', video_path,   # 输入视频
-        '-vf', f"subtitles='{srt_path_esc}'", # 视频滤镜添加字幕
-        '-c:a', 'copy',     # 音频直接复制
-        output_video_path
+        'ffmpeg', '-y', '-i', video_path, 
+        '-vf', f"subtitles='{srt_path_esc}'", 
+        '-c:a', 'copy', output_video_path
     ]
     subprocess.run(cmd)
     print("视频处理完成！")
 
 if __name__ == "__main__":
-    import argparse
+    # 多进程在Windows下必须要有这一句保护
+    mp.freeze_support()
     
-    parser = argparse.ArgumentParser(description='视频OCR字幕提取翻译工具')
-    parser.add_argument('video', nargs='?', default=None, help='指定视频文件路径（可选，不指定则处理当前目录下所有视频）')
+    import argparse
+    parser = argparse.ArgumentParser(description='多进程并发视频OCR字幕提取工具')
+    parser.add_argument('video', nargs='?', default=None, help='指定视频文件路径')
     args = parser.parse_args()
     
     video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm']
@@ -311,11 +312,10 @@ if __name__ == "__main__":
             ext = os.path.splitext(f)[1].lower()
             if ext in video_extensions:
                 video_files.append(os.path.join(VIDEO_DIR, f))
-        
         if not video_files:
             print(f"在目录 {VIDEO_DIR} 中未找到视频文件")
             exit(1)
-    
+            
     print(f"找到 {len(video_files)} 个视频文件: {video_files}")
     
     for video_path in video_files:
@@ -326,29 +326,22 @@ if __name__ == "__main__":
         output_srt = os.path.splitext(video_path)[0] + "_output.srt"
         
         try:
-            # 1. 从视频画面中提取文字 (OCR)
-            segments = extract_text_from_video(video_path)
+            # 核心替换：使用多进程版的方法
+            segments = extract_text_from_video_multiprocess(video_path)
             
             if not segments:
                 print(f"未在视频 {video_path} 中检测到任何英文字幕，跳过。")
                 continue
             
-            # 2. 先合并时间相近的短字幕（在翻译之前合并）
             segments = merge_short_subtitles(segments, min_duration=2.0, gap_threshold=SUBTITLE_GAP_THRESHOLD)
-            
-            # 3. 从合并后的字幕提取文本进行翻译
             original_texts = [s['text'].strip() for s in segments]
             
-            # 4. 翻译
             if not GEMINI_API_KEY:
-                 print("请在代码中填入真实的 GEMINI_API_KEY")
+                 print("请在 .env 配置中填入真实的 GEMINI_API_KEY")
                  exit(1)
                  
             translated_texts = translate_texts(original_texts, GEMINI_API_KEY, GEMINI_API_URL, GEMINI_MODEL)
-            
-            # 5. 生成字幕文件
             create_srt(segments, translated_texts, output_srt)
-            
             print(f"字幕已保存至: {output_srt} (共 {len(segments)} 条)")
             
             # 在烧录之前暂停，等待用户人工修改 srt 文件
@@ -359,7 +352,6 @@ if __name__ == "__main__":
             print(f"{'='*50}\n")
             input("修改保存后，请按【回车键】继续进行视频烧录...")
             
-            # 5. 烧录到视频
             output_video = os.path.splitext(video_path)[0] + "_with_subs.mp4"
             burn_subtitles_to_video(video_path, output_srt, output_video)
             print(f"带字幕的视频已保存至: {output_video}")
