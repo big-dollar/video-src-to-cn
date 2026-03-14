@@ -241,13 +241,29 @@ def create_srt(segments, translated_texts, output_path="output.srt"):
 def burn_subtitles_to_video(video_path, srt_path, output_video_path="output_with_subs.mp4"):
     print(f"正在将字幕烧录到视频中: {output_video_path} ...")
     import subprocess
-    srt_path_esc = srt_path.replace('\\', '/').replace(':', '\\:')
+    # 修复文件名中的特殊字符（如等号、空格等），防止 ffmpeg 参数解析错误
+    # ffmpeg 的 subtitles 滤镜对路径中的特殊字符比较敏感，需要转义
+    srt_path_esc = srt_path.replace('\\', '/').replace("'", "\\'")
+    video_path_esc = video_path.replace('\\', '/').replace("'", "\\'")
+    
+    # 在 Windows 上，如果路径包含冒号（如驱动器盘符），需要特殊处理
+    # 这里我们使用正则替换替换成转义字符
+    import re
+    srt_path_esc = re.sub(r":(?![/\\])", r"\\:", srt_path_esc)
+    
     cmd = [
-        'ffmpeg', '-y', '-i', video_path, 
+        'ffmpeg', '-y', '-i', video_path_esc, 
         '-vf', f"subtitles='{srt_path_esc}'", 
         '-c:a', 'copy', output_video_path
     ]
-    subprocess.run(cmd)
+    
+    print(f"Executing command: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"FFmpeg Error: {result.stderr}")
+    else:
+        print("视频处理完成！")
     print("视频处理完成！")
 
 if __name__ == "__main__":
