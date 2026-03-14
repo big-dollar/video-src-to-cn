@@ -3,3 +3,5 @@ easyocr
 srt
 google-generativeai
 python-dotenv
+# Note: PyTorch (torch) must be installed manually for GPU support.
+# See README.md for installation instructions based on your CUDA version.

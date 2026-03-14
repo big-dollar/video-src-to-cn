@@ -39,3 +39,9 @@ Thumbs.db
 
 # Cookies (sensitive)
 cookies.txt
+
+# video download dir
+download_video/
+
+# Translated script files
+translate_script.py
